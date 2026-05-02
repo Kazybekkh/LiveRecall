@@ -19,7 +19,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 
 from ..config import settings
-from ..mongo import collection, watch
+from ..mongo import collection
 from ..tracing import MongoTraceCallback
 from ..util import new_id, now_ms
 
@@ -86,7 +86,7 @@ def _llm() -> ChatOpenAI:
         temperature=0,
         max_tokens=350,
         api_key=settings.openai_api_key,
-        timeout=5,
+        timeout=15,
     )
 
 
@@ -151,16 +151,3 @@ def _fallback_queries(question_text: str) -> list[dict[str, Any]]:
         {"source": "events", "filter": {}, "vector_query": "", "weight": 1.0},
         {"source": "notes", "filter": {}, "vector_query": question_text, "weight": 0.7},
     ]
-
-
-async def run_router_loop() -> None:
-    """Subscribe to new questions and produce retrieval_plans."""
-    log.info("router loop watching questions change stream")
-    async for change in watch("questions"):
-        if change.get("operationType") != "insert":
-            continue
-        q = change.get("fullDocument") or {}
-        try:
-            await plan(q)
-        except Exception as e:  # noqa: BLE001
-            log.exception("router failed: %s", e)

@@ -1,9 +1,18 @@
-"""LiveKit Agents worker — the bridge between the room and the agent pipeline.
+"""LiveKit Agents worker — bridges the room to the direct-call orchestrator.
 
 Per session/room:
-  - Subscribes to remote audio track → ElevenLabs Scribe v2 Realtime STT.
-  - Subscribes to remote video track → 1 fps frame sampler → `video_frames`.
-  - Publishes one outbound audio track; Answerer streams TTS into it.
+  - Subscribes to remote audio track  → ElevenLabs Scribe v2 Realtime STT.
+  - On STT-final question              → calls orchestrator.run_pipeline AND
+                                          streams the answerer tokens out as
+                                          ElevenLabs Flash v2.5 TTS into the
+                                          published LiveKit audio track.
+  - Subscribes to remote video track  → 1 fps frame sampler. Every sampled
+                                          frame is run through Vision directly
+                                          (process_frame), which also schedules
+                                          the local-cache prefetch.
+
+The Mongo change-stream agent bus is gone (see backend/orchestrator.py +
+DECISIONS.md (h)). The worker is now an in-process pipeline driver.
 
 Run as: `python -m backend.worker dev`
 """
@@ -14,6 +23,7 @@ import asyncio
 import base64
 import io
 import logging
+from collections.abc import AsyncIterator
 from typing import Any
 
 from livekit import rtc
@@ -25,15 +35,19 @@ from livekit.agents import (
 )
 from PIL import Image
 
+from .agents.answerer import stream_tokens
+from .agents.vision import process_frame
 from .config import settings
 from .mongo import collection, init_collections
+from .orchestrator import run_pipeline
 from .stt import ScribeSession
 from .tracing import trace_event
+from .tts import publish_to_room
 from .util import new_id, now_ms
 
 log = logging.getLogger("worker")
 
-# session_id -> (room, audio_source) so the Answerer loop can publish back
+# session_id -> {"room": rtc.Room, "audio_source": rtc.AudioSource}
 ROOM_REGISTRY: dict[str, dict[str, Any]] = {}
 
 
@@ -49,10 +63,7 @@ async def entrypoint(ctx: JobContext) -> None:
     room = ctx.room
     session_id = _session_id_from_room(room.name)
     log.info("worker joined room=%s session=%s", room.name, session_id)
-    # Use $setOnInsert for fields the /token endpoint may have already written
-    # (capture_mode, started_at) so we don't blow them away when the worker
-    # joins. /token is the authoritative writer for capture_mode; the worker
-    # only refreshes the room/ended_at fields on every join.
+    # /token writes capture_mode + started_at — don't clobber them.
     await collection("sessions").update_one(
         {"_id": session_id},
         {
@@ -86,24 +97,76 @@ async def entrypoint(ctx: JobContext) -> None:
             if pub.track:
                 _on_track(pub.track, pub, participant)
 
+    log.info("worker ready (session=%s); waiting on tracks", session_id)
     await asyncio.Future()  # keep the worker running until the room ends.
 
 
+# --- Audio (STT → orchestrator → TTS back into the room) --------------------
+
 async def _consume_audio(track: rtc.Track, session_id: str) -> None:
     log.info("audio track subscribed (session=%s)", session_id)
-    stt = ScribeSession(session_id=session_id)
+
+    async def _on_question(qdoc: dict[str, Any]) -> None:
+        """Handle every STT-detected question by running the full pipeline AND
+        streaming the spoken answer back into the LiveKit audio track."""
+        log.info("STT question detected qid=%s text=%s", qdoc["_id"], qdoc.get("text", "")[:60])
+        try:
+            await _answer_into_room(qdoc, session_id)
+        except Exception as e:  # noqa: BLE001
+            log.exception("worker failed to answer qid=%s: %s", qdoc["_id"], e)
+
+    stt = ScribeSession(session_id=session_id, on_question=_on_question)
     await stt.start()
     try:
         astream = rtc.AudioStream(track)
         async for ev in astream:
             frame: rtc.AudioFrame = ev.frame
             if frame.sample_rate != stt.sample_rate or frame.num_channels != 1:
-                # remix to 16k mono
                 frame = frame.remix_and_resample(stt.sample_rate, 1)
             await stt.send(bytes(frame.data))
     finally:
         await stt.close()
 
+
+async def _answer_into_room(qdoc: dict[str, Any], session_id: str) -> None:
+    """Run the orchestrator up through Reranker, then stream Answerer tokens
+    straight into ElevenLabs TTS → the LiveKit AudioSource. We bypass
+    `orchestrator.run_pipeline`'s text-only Answerer call because we want the
+    stream to start firing audio as soon as the first token lands.
+    """
+    audio_source = get_audio_source(session_id)
+    if audio_source is None:
+        log.warning("no audio_source for session=%s; falling back to text-only", session_id)
+        await run_pipeline(qdoc)
+        return
+
+    # Stages 1–3: router → retrievers → reranker (writes final_context).
+    from .agents.reranker import rerank
+    from .agents.retrievers import run_plan as run_retrieval_plan
+    from .agents.router import plan as build_plan
+
+    t_pipeline = now_ms()
+    plan = await build_plan(qdoc)
+    await run_retrieval_plan(plan)
+    final_ctx = await rerank(plan)
+
+    # Stage 4: answerer streams tokens; we pump them into ElevenLabs WS → PCM
+    # → LiveKit audio frames.
+    text = qdoc.get("text", "")
+    tokens = stream_tokens(text, final_ctx)
+    bytes_published = await publish_to_room(audio_source, tokens)
+
+    await trace_event(
+        agent="worker.answer_tts",
+        stage="end",
+        question_id=qdoc["_id"],
+        session_id=session_id,
+        latency_ms=now_ms() - t_pipeline,
+        payload={"audio_bytes": bytes_published, "rerank_passes": final_ctx.get("rerank_passes")},
+    )
+
+
+# --- Video (frame sampler → Vision direct) ----------------------------------
 
 async def _consume_video(track: rtc.Track, session_id: str) -> None:
     log.info("video track subscribed (session=%s)", session_id)
@@ -122,7 +185,6 @@ async def _consume_video(track: rtc.Track, session_id: str) -> None:
 
 
 async def _ingest_frame(frame: rtc.VideoFrame, session_id: str) -> None:
-    # Convert to JPEG via Pillow.
     rgb = frame.convert(rtc.VideoBufferType.RGB24)
     img = Image.frombytes("RGB", (rgb.width, rgb.height), bytes(rgb.data))
     img.thumbnail((640, 640))
@@ -136,6 +198,7 @@ async def _ingest_frame(frame: rtc.VideoFrame, session_id: str) -> None:
         "image_b64": b64,
         "width": img.width,
         "height": img.height,
+        "source": "livekit",
     }
     await collection("video_frames").insert_one(doc)
     await trace_event(
@@ -144,6 +207,17 @@ async def _ingest_frame(frame: rtc.VideoFrame, session_id: str) -> None:
         session_id=session_id,
         payload={"frame_id": doc["_id"], "size": len(b64)},
     )
+    # Direct invocation: scene_context insert + apparatus + cache prefetch all
+    # happen inside process_frame. Fire-and-forget so the next sampled frame
+    # isn't blocked by the LLM call.
+    asyncio.create_task(_safe_process_frame(doc))
+
+
+async def _safe_process_frame(doc: dict[str, Any]) -> None:
+    try:
+        await process_frame(doc)
+    except Exception as e:  # noqa: BLE001
+        log.exception("vision process_frame failed: %s", e)
 
 
 def _session_id_from_room(room_name: str) -> str:

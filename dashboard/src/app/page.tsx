@@ -43,7 +43,7 @@ export default function DashboardPage() {
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">LiveRecall</h1>
           <p className="text-sm text-slate-400">
-            Clinical decision support grounded in live visual memory · MongoDB Atlas + LiveKit
+            Clinical decision support grounded in live visual memory · MongoDB Atlas
           </p>
         </div>
         <div className="flex items-center gap-3">
@@ -101,7 +101,7 @@ export default function DashboardPage() {
       </div>
 
       <footer className="text-[11px] text-slate-500 text-center pt-6">
-        “Adaptive retrieval. Live visual memory. MongoDB and LiveKit as the brain and the bloodstream.”
+        “Adaptive retrieval. Live visual memory. MongoDB Atlas as the brain.”
       </footer>
     </main>
   );

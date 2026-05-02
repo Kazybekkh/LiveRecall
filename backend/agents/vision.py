@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from pathlib import Path
 from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -27,11 +28,76 @@ from shared.types import DEFAULT_CAPTURE_MODE, CaptureMode
 
 from ..config import settings
 from ..embeddings import embed
-from ..mongo import collection, watch
+from ..mongo import collection
 from ..tracing import MongoTraceCallback, trace_event
 from ..util import new_id, now_ms
 
 log = logging.getLogger("vision")
+
+
+# --- Apparatus catalog vocab (loaded from committed fixtures) --------------
+# Vision must emit `apparatus` strings that *exactly* match `name` values in
+# the documents collection — otherwise the Router/Retrievers can't filter by
+# them. We load the canonical set from the JSONL fixtures at import time so
+# the vocab never drifts from the catalog the seeder loads. Falls back to a
+# hand-curated list if the fixtures aren't present (e.g. unit-test imports).
+
+_FIXTURE_DIR = Path(__file__).resolve().parents[2] / "data" / "fixtures"
+_FIXTURES = (
+    _FIXTURE_DIR / "dailymed_sample.jsonl",
+    _FIXTURE_DIR / "wikimedia_equipment_sample.jsonl",
+)
+
+
+def _load_catalog_vocab() -> tuple[list[str], list[str]]:
+    """Returns (medication_names, equipment_names), each lowercase + dedup'd."""
+    meds: dict[str, None] = {}
+    equip: dict[str, None] = {}
+    for path in _FIXTURES:
+        if not path.exists():
+            continue
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                name = (rec.get("name") or rec.get("medication") or "").strip().lower()
+                if not name:
+                    continue
+                if (rec.get("category") or "medication") == "equipment":
+                    equip.setdefault(name, None)
+                else:
+                    meds.setdefault(name, None)
+    if not meds and not equip:
+        # hand-curated safety net so the prompt stays useful in test envs
+        meds = dict.fromkeys([
+            "metformin", "insulin glargine", "lisinopril", "amlodipine",
+            "warfarin", "atorvastatin", "albuterol", "omeprazole",
+            "levothyroxine", "amoxicillin",
+        ])
+        equip = dict.fromkeys([
+            "infusion pump", "pulse oximeter", "stethoscope", "glucose meter",
+            "defibrillator", "mechanical ventilator", "syringe", "insulin pen",
+            "patient wristband",
+        ])
+    return list(meds), list(equip)
+
+
+_MED_VOCAB, _EQUIP_VOCAB = _load_catalog_vocab()
+
+
+def _vocab_block() -> str:
+    """Render the catalog vocab into a compact prompt section."""
+    return (
+        "  Medications (when you see the labelled bottle / blister pack / pen):\n"
+        f"    {', '.join(_MED_VOCAB)}\n\n"
+        "  Equipment / devices:\n"
+        f"    {', '.join(_EQUIP_VOCAB)}"
+    )
 
 SYSTEM = """You extract structured scene context from a single first-person frame
 captured by a clinician's camera (glasses or phone) at the point of care.
@@ -51,17 +117,7 @@ piece of medical machinery, equipment, or medication packaging. Use these
 exact strings when applicable — they map 1:1 to entries in the apparatus
 catalog so the References retriever can pull (name, context, image) for them:
 
-  Medications (when you see the labelled bottle / blister pack / pen):
-    metformin, insulin glargine, lisinopril, amlodipine, warfarin,
-    atorvastatin, albuterol, omeprazole, levothyroxine, amoxicillin
-
-  Equipment / devices:
-    infusion pump, vital signs monitor, pulse oximeter, blood pressure cuff,
-    stethoscope, glucose meter, defibrillator, mechanical ventilator,
-    iv pole, syringe, insulin pen, insulin pump, hospital bed, wheelchair,
-    crash cart, otoscope, thermometer, urinary catheter, endotracheal tube,
-    bag valve mask, ecg machine, ultrasound probe, suction machine,
-    nasal cannula, patient wristband
+__APPARATUS_VOCAB__
 
 If unsure of identity, leave `apparatus` empty rather than guessing.
 
@@ -96,7 +152,8 @@ _POV_HINTS: dict[CaptureMode, str] = {
 
 def _system_prompt_for(capture_mode: CaptureMode) -> str:
     """Surgical prompt extension — append a POV hint, do not rewrite SYSTEM."""
-    return SYSTEM + _POV_HINTS.get(capture_mode, _POV_HINTS["phone"])
+    base = SYSTEM.replace("__APPARATUS_VOCAB__", _vocab_block())
+    return base + _POV_HINTS.get(capture_mode, _POV_HINTS["phone"])
 
 
 def _llm() -> ChatOpenAI:
@@ -173,9 +230,9 @@ async def process_frame(frame_doc: dict[str, Any]) -> str | None:
     if not image_b64:
         return None
 
-    # The frame writer (LiveKit worker / /snap) may stamp capture_mode directly
-    # on the frame doc; otherwise fall back to whatever was persisted on the
-    # session at /token time, then to the safer phone default.
+    # The frame writer (/snap, or any future ingress) may stamp capture_mode
+    # directly on the frame doc; otherwise fall back to whatever was persisted
+    # on the session, then to the safer phone default.
     capture_mode: CaptureMode = (
         frame_doc.get("capture_mode")
         or await _get_session_capture_mode(session_id)
@@ -227,8 +284,8 @@ async def process_frame(frame_doc: dict[str, Any]) -> str | None:
 # --- Capture-mode lookup ----------------------------------------------------
 # Tiny in-process cache so the per-frame Vision call doesn't round-trip Mongo
 # just to read `sessions.capture_mode`. Capture mode is written once per
-# session (at /token time or first /snap) and never changes mid-session, so a
-# never-evicted dict is fine for hackathon scope.
+# session (on first /snap) and never changes mid-session, so a never-evicted
+# dict is fine for hackathon scope.
 _SESSION_CAPTURE_MODE: dict[str, CaptureMode] = {}
 
 
@@ -310,16 +367,3 @@ def schedule_prefetch_from_scene(
         if not n:
             continue
         prefetch_medication_refs(session_id, n)
-
-
-async def run_vision_loop() -> None:
-    """Subscribe to `video_frames` change stream and run Vision on every insert."""
-    log.info("vision loop watching video_frames change stream")
-    async for change in watch("video_frames"):
-        if change.get("operationType") != "insert":
-            continue
-        frame = change.get("fullDocument") or {}
-        try:
-            await process_frame(frame)
-        except Exception as e:  # noqa: BLE001
-            log.exception("vision failed: %s", e)

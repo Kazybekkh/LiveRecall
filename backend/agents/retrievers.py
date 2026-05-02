@@ -31,7 +31,7 @@ from ..local_cache import (
     medication_refs_key,
     patient_events_key,
 )
-from ..mongo import collection, watch
+from ..mongo import collection
 from ..tracing import trace_event
 from ..util import new_id, now_ms
 from shared.types import VEC_IDX_DOCS, VEC_IDX_TRANSCRIPTS
@@ -195,9 +195,14 @@ async def _query_patient_events_mongo(patient_id: str, *, limit: int = 5) -> lis
     ]
     out: list[dict[str, Any]] = []
     async for d in collection("clinical_events").aggregate(pipeline):
-        ts = int(d.get("timestamp") or 0)
-        if hasattr(d.get("timestamp"), "timestamp"):
-            ts = int(d["timestamp"].timestamp() * 1000)
+        raw_ts = d.get("timestamp")
+        if hasattr(raw_ts, "timestamp"):       # datetime → ms since epoch
+            ts = int(raw_ts.timestamp() * 1000)
+        else:
+            try:
+                ts = int(raw_ts or 0)
+            except (TypeError, ValueError):
+                ts = 0
         med = d.get("medication")
         snippet_bits = [
             f"[{d.get('event_type')} • {d.get('severity')}]",
@@ -390,15 +395,3 @@ async def run_plan(plan_doc: dict[str, Any]) -> None:
     sid = plan_doc.get("session_id")
     queries = plan_doc.get("queries") or []
     await asyncio.gather(*[_run_one(plan_id, qid, sid, q) for q in queries])
-
-
-async def run_retrievers_loop() -> None:
-    log.info("retrievers loop watching retrieval_plans change stream")
-    async for change in watch("retrieval_plans"):
-        if change.get("operationType") != "insert":
-            continue
-        plan = change.get("fullDocument") or {}
-        try:
-            await run_plan(plan)
-        except Exception as e:  # noqa: BLE001
-            log.exception("retrievers failed: %s", e)

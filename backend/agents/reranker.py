@@ -25,7 +25,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 
 from ..config import settings
-from ..mongo import collection, watch
+from ..mongo import collection
 from ..tracing import MongoTraceCallback, trace_event
 from ..util import new_id, now_ms
 from . import active_tools
@@ -107,7 +107,7 @@ def _llm(*, max_tokens: int = 700) -> ChatOpenAI:
         temperature=0,
         max_tokens=max_tokens,
         api_key=settings.openai_api_key,
-        timeout=5,
+        timeout=20,
     )
 
 
@@ -125,6 +125,23 @@ async def _wait_for_all_results(plan_id: str, timeout_s: float = 4.0) -> list[di
 def _trim(s: str, n: int = 220) -> str:
     s = (s or "").strip().replace("\n", " ")
     return s if len(s) <= n else s[: n - 1] + "…"
+
+
+# Fields we strip from the LLM-facing copy of metadata. image_b64 is the big
+# offender (~10–20 KB per chunk × 5 chunks = ~100 KB of base64 inside the
+# prompt → token blow-up + OpenAI read timeout). Image data still lives on the
+# stored final_context / retrieval_results so the dashboard can render it.
+_LLM_STRIP_META_KEYS = {
+    "image_b64",
+    "image_mime",
+    "image_attribution",
+    "image_source_url",
+    "text_embedding",
+}
+
+
+def _llm_safe_metadata(md: dict[str, Any] | None) -> dict[str, Any]:
+    return {k: v for k, v in (md or {}).items() if k not in _LLM_STRIP_META_KEYS}
 
 
 async def _scene_blob(plan: dict[str, Any]) -> str:
@@ -216,17 +233,25 @@ async def rerank(plan: dict[str, Any]) -> dict[str, Any]:
     cb = MongoTraceCallback(agent="reranker", question_id=qid, session_id=session_id)
 
     results = await _wait_for_all_results(plan["_id"])
+    # `bundle` is what we send to the LLM — it MUST NOT include image_b64 or
+    # other heavy/binary fields, or OpenAI will time out parsing the prompt.
+    # `by_id` is what we use after ranking to re-attach the FULL metadata
+    # (including image_b64) for storage + dashboard rendering.
     bundle = []
+    by_id: dict[str, dict[str, Any]] = {}
     for r in results:
         for item in r.get("results", [])[:5]:
-            bundle.append({
-                "document_id": item.get("document_id"),
+            full_meta = item.get("metadata", {}) or {}
+            doc_id = item.get("document_id")
+            entry = {
+                "document_id": doc_id,
                 "source": r.get("source"),
                 "snippet": _trim(item.get("snippet", "")),
                 "score": item.get("score"),
-                "metadata": item.get("metadata", {}),
-            })
-    by_id = {b["document_id"]: b for b in bundle}
+                "metadata": _llm_safe_metadata(full_meta),
+            }
+            bundle.append(entry)
+            by_id[doc_id] = {**entry, "metadata": full_meta}
 
     scene = await _scene_blob(plan)
 
@@ -312,15 +337,3 @@ async def rerank(plan: dict[str, Any]) -> dict[str, Any]:
     }
     await collection("final_context").insert_one(final)
     return final
-
-
-async def run_reranker_loop() -> None:
-    log.info("reranker loop watching retrieval_plans change stream")
-    async for change in watch("retrieval_plans"):
-        if change.get("operationType") != "insert":
-            continue
-        plan = change.get("fullDocument") or {}
-        try:
-            await rerank(plan)
-        except Exception as e:  # noqa: BLE001
-            log.exception("reranker failed: %s", e)

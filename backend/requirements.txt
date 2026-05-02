@@ -3,8 +3,9 @@ uvicorn[standard]==0.32.0
 python-dotenv==1.0.1
 
 # Mongo
+# motor 3.6 pins pymongo<4.10; keep these aligned.
 motor==3.6.0
-pymongo==4.10.1
+pymongo==4.9.2
 
 # LangChain + agents
 langchain-core==0.3.21
@@ -13,22 +14,10 @@ langchain-mongodb==0.3.0
 langgraph==0.2.50
 openai==1.55.3
 
-# LiveKit
-livekit==0.18.0
-livekit-agents==0.12.5
-livekit-api==0.8.0
-livekit-plugins-elevenlabs==0.7.10
-livekit-plugins-openai==0.10.10
-livekit-plugins-silero==0.7.4
-
-# Voice I/O — single vendor: ElevenLabs handles both STT (Scribe v2 Realtime,
-# direct websocket in backend/stt.py) and TTS (Flash v2.5, direct websocket in
-# backend/tts.py). See DECISIONS.md.
-elevenlabs==1.13.1
-
-# Imaging
+# Imaging (Vision agent decodes frames sent over /snap)
 Pillow==11.0.0
-numpy==2.1.3
+# langgraph caps numpy in some lines — let pip resolve.
+numpy
 
 # Misc
 httpx==0.27.2

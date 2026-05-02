@@ -19,25 +19,29 @@ def _env(name: str, default: str | None = None, *, required: bool = False) -> st
 
 @dataclass(frozen=True)
 class Settings:
-    livekit_url: str
-    livekit_api_key: str
-    livekit_api_secret: str
     mongodb_uri: str
     mongodb_db: str
     openai_api_key: str
-    elevenlabs_api_key: str
-    elevenlabs_voice_id: str
     backend_host: str
     backend_port: int
     public_backend_url: str
+
+    # LiveKit (optional — only needed for /token + worker streaming path).
+    livekit_url: str = ""
+    livekit_api_key: str = ""
+    livekit_api_secret: str = ""
+
+    # ElevenLabs (optional — only needed for streaming TTS/STT).
+    elevenlabs_api_key: str = ""
+    elevenlabs_voice_id: str = "21m00Tcm4TlvDq8ikWAM"
 
     # Hard latency targets (used for the dashboard latency monitor).
     target_total_ms: int = 2000
     ceiling_total_ms: int = 2500
 
     # Vision sampling.
-    frame_sample_hz: float = 1.0          # 1 fps from the LiveKit video track
     scene_context_ttl_s: int = 10         # reuse vision output for up to 10s
+    frame_sample_hz: float = 1.0          # how often the worker grabs a frame
 
     # Vector search.
     num_candidates: int = 50
@@ -46,17 +50,17 @@ class Settings:
 
 def load_settings() -> Settings:
     return Settings(
-        livekit_url=_env("LIVEKIT_URL"),
-        livekit_api_key=_env("LIVEKIT_API_KEY"),
-        livekit_api_secret=_env("LIVEKIT_API_SECRET"),
         mongodb_uri=_env("MONGODB_URI"),
         mongodb_db=_env("MONGODB_DB", "liverecall"),
         openai_api_key=_env("OPENAI_API_KEY"),
-        elevenlabs_api_key=_env("ELEVENLABS_API_KEY"),
-        elevenlabs_voice_id=_env("ELEVENLABS_VOICE_ID", "21m00Tcm4TlvDq8ikWAM"),
         backend_host=_env("BACKEND_HOST", "0.0.0.0"),
         backend_port=int(_env("BACKEND_PORT", "8000")),
         public_backend_url=_env("PUBLIC_BACKEND_URL", "http://localhost:8000"),
+        livekit_url=_env("LIVEKIT_URL", ""),
+        livekit_api_key=_env("LIVEKIT_API_KEY", ""),
+        livekit_api_secret=_env("LIVEKIT_API_SECRET", ""),
+        elevenlabs_api_key=_env("ELEVENLABS_API_KEY", ""),
+        elevenlabs_voice_id=_env("ELEVENLABS_VOICE_ID", "21m00Tcm4TlvDq8ikWAM"),
     )
 
 
