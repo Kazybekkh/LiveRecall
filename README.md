@@ -1,4 +1,5 @@
 # LiveRecall
+MongoDB Agentic Evolution Hackathon
 
 > **✅ Demo state (2026-05-02): full multi-source seed live, Path A verified.**
 > Atlas carries the multimodal apparatus catalog (DailyMed medications +
